@@ -38,6 +38,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # FUMA: assign fractal complexity C_f to the initial Gaussians by projecting them
+    # into the training views and sampling precomputed DBC fractal maps.
+    gaussians.compute_fractal_complexity(scene.getTrainCameras())
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 

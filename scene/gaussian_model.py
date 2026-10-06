@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -20,7 +21,11 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from arguments.fuma_config import split_sharpness, side_score_lr, split_dir_lr
+from arguments.fuma_config import (split_sharpness, side_score_lr, split_dir_lr,
+                                   fractal_lambda, fractal_gamma, fractal_downsample,
+                                   fractal_patch_size, fractal_camera_stride,
+                                   prune_w_opacity, prune_w_complexity, prune_w_gradient,
+                                   prune_retention_thresh)
 
 class GaussianModel:
 
@@ -54,6 +59,8 @@ class GaussianModel:
         self._opacity_core2 = torch.empty(0)
         self._side_score = torch.empty(0)
         self._split_direction = torch.empty(0)
+        self._fractal_complexity = torch.empty(0)
+        self._grad_mag = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -77,6 +84,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self._fractal_complexity,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -93,9 +101,10 @@ class GaussianModel:
         self._side_score,
         self._split_direction,
         self.max_radii2D,
-        xyz_gradient_accum, 
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        self._fractal_complexity,
+        opt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -148,7 +157,62 @@ class GaussianModel:
         opacity_core2 = self.opacity_activation(self._opacity_core2)
         w1, _ = self.compute_core_weight()
         return opacity_core1, opacity_core2, w1
-    
+
+    def compute_fractal_complexity(self, cameras, patch_size=fractal_patch_size,
+                                   scales=(2, 4, 8, 16), downsample=fractal_downsample,
+                                   camera_stride=fractal_camera_stride):
+        """
+        FUMA: assign each Gaussian a fractal complexity C_f in [0, 1].
+
+        For each training camera we compute a DBC fractal map of its image, then
+        project every Gaussian mean into that view and bilinearly sample C_f at the
+        projected pixel. C_f is max-pooled over cameras (complex if any view sees it
+        in complex structure). Computed once on the SfM point cloud; densification
+        propagates C_f from parent to child Gaussians.
+        """
+        from utils.fractal_utils import compute_fractal_map, normalize_complexity_map
+
+        xyz = self.get_xyz.detach()
+        N = xyz.shape[0]
+        if N == 0:
+            self._fractal_complexity = torch.zeros((0, 1), device="cuda")
+            return self._fractal_complexity
+
+        acc = torch.zeros((N, 1), device="cuda")
+        ones = torch.ones((N, 1), device="cuda")
+
+        for cam in cameras[::camera_stride]:
+            H, W = cam.image_height, cam.image_width
+            gray = (cam.original_image.detach().mean(dim=0) * 255.0).clamp(0, 255).cpu().numpy().astype(np.float32)
+            gray = gray[::downsample, ::downsample]
+            Hs, Ws = gray.shape
+
+            D_map = compute_fractal_map(gray, patch_size=patch_size, scales=scales, stride=max(patch_size // 2, 4))
+            C_map = normalize_complexity_map(D_map)
+            C_t = torch.from_numpy(C_map).float().cuda().unsqueeze(0).unsqueeze(0)  # [1,1,Hs,Ws]
+
+            # project Gaussian means world -> clip -> pixel
+            pts = torch.cat([xyz, ones], dim=1)  # [N,4]
+            clip = (cam.full_proj_transform @ pts.T).T  # [N,4]
+            w = clip[:, 3:4]
+            ndc = clip[:, :3] / w.clamp_min(1e-8)
+            px = (ndc[:, 0] + 1.0) * 0.5 * W
+            py = (1.0 - ndc[:, 1]) * 0.5 * H
+            pxs = px / downsample
+            pys = py / downsample
+            inside = (w.squeeze(-1) > 1e-6) & (pxs >= 0) & (pxs < Ws) & (pys >= 0) & (pys < Hs)
+
+            gx = (pxs / max(Ws - 1, 1)) * 2.0 - 1.0
+            gy = (pys / max(Hs - 1, 1)) * 2.0 - 1.0
+            grid = torch.stack([gx, gy], dim=-1).reshape(1, N, 1, 2)
+            sampled = F.grid_sample(C_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            sampled = sampled[0, 0, :, 0]  # [N]
+            sampled = torch.where(inside, sampled, torch.zeros_like(sampled))
+            acc = torch.maximum(acc, sampled.unsqueeze(-1))
+
+        self._fractal_complexity = acc.detach()
+        return self._fractal_complexity
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -184,6 +248,8 @@ class GaussianModel:
         split_direction = self._normalize_split_direction(torch.tensor(np.asarray(pcd.normals)).float().cuda())
         self._side_score = nn.Parameter(side_score.requires_grad_(True))
         self._split_direction = nn.Parameter(split_direction.requires_grad_(True))
+        self._fractal_complexity = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._grad_mag = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -312,6 +378,8 @@ class GaussianModel:
         self._opacity_core2 = nn.Parameter(torch.tensor(opacities_core2, dtype=torch.float, device="cuda").requires_grad_(True))
         self._side_score = nn.Parameter(torch.tensor(side_score, dtype=torch.float, device="cuda").requires_grad_(True))
         self._split_direction = nn.Parameter(self._normalize_split_direction(torch.tensor(split_direction, dtype=torch.float, device="cuda")).requires_grad_(True))
+        self._fractal_complexity = torch.zeros((xyz.shape[0], 1), device="cuda")
+        self._grad_mag = torch.zeros((xyz.shape[0], 1), device="cuda")
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -368,6 +436,8 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self._fractal_complexity = self._fractal_complexity[valid_points_mask]
+        self._grad_mag = self._grad_mag[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -391,7 +461,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation, new_fractal_complexity, new_grad_mag):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -413,6 +483,10 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # non-optimizable per-Gaussian fractal complexity (children inherit parent C_f)
+        self._fractal_complexity = torch.cat((self._fractal_complexity, new_fractal_complexity), dim=0)
+        self._grad_mag = torch.cat((self._grad_mag, new_grad_mag), dim=0)
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -422,7 +496,11 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        # FUMA: fractal-adaptive threshold T_i = T_0 * (1 - lambda * C_f_i) — complex
+        # regions split at a lower gradient so they receive more Gaussians.
+        c_f = self._fractal_complexity.squeeze(-1)
+        split_threshold = grad_threshold * (1.0 - fractal_lambda * c_f)
+        selected_pts_mask = torch.where(padded_grad >= split_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -431,7 +509,11 @@ class GaussianModel:
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        # FUMA: fractal-adaptive child scale s' = s * (1 - gamma * C_f_i) — finer
+        # Gaussians in complex regions.
+        c_f_rep = c_f[selected_pts_mask].unsqueeze(-1).repeat(N, 1)
+        child_scaling = self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N) * (1.0 - fractal_gamma * c_f_rep)
+        new_scaling = self.scaling_inverse_activation(child_scaling)
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -439,18 +521,23 @@ class GaussianModel:
         new_opacity_core2 = self._opacity_core2[selected_pts_mask].repeat(N,1)
         new_side_score = self._side_score[selected_pts_mask].repeat(N,1)
         new_split_direction = self._split_direction[selected_pts_mask].repeat(N,1)
+        new_fractal_complexity = self._fractal_complexity[selected_pts_mask].repeat(N,1)
+        new_grad_mag = self._grad_mag[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity_core1, new_opacity_core2, new_side_score, new_split_direction, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity_core1, new_opacity_core2, new_side_score, new_split_direction, new_scaling, new_rotation, new_fractal_complexity, new_grad_mag)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        # FUMA: fractal-adaptive threshold T_i = T_0 * (1 - lambda * C_f_i).
+        c_f = self._fractal_complexity.squeeze(-1)
+        clone_threshold = grad_threshold * (1.0 - fractal_lambda * c_f)
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= clone_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -460,17 +547,31 @@ class GaussianModel:
         new_split_direction = self._split_direction[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_fractal_complexity = self._fractal_complexity[selected_pts_mask]
+        new_grad_mag = self._grad_mag[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation, new_fractal_complexity, new_grad_mag)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # FUMA: cache the normalised gradient magnitude for the retention score
+        # before clone/split zero the accumulators (children inherit parent value).
+        grad_mag = grads.squeeze(-1)
+        self._grad_mag = (grad_mag / (grad_mag.max() + 1e-8)).unsqueeze(-1)
+
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # FUMA: fractal-aware retention score R = w1*a + w2*C_f + w3*M. Low-opacity
+        # Gaussians in complex structure or with high gradient are retained.
+        alpha = self.get_opacity.squeeze(-1)
+        c_f = self._fractal_complexity.squeeze(-1)
+        m = self._grad_mag.squeeze(-1)
+        retention = prune_w_opacity * alpha + prune_w_complexity * c_f + prune_w_gradient * m
+        prune_mask = retention < prune_retention_thresh
+
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
