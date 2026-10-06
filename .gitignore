@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Experiment outputs
+exp*/
+output/
+data/
+tensorboard_3d/
+screenshots/
+
+# IDE
+.idea/
+.vscode/
+
+# Misc
+*.tar.gz
+*.zip
