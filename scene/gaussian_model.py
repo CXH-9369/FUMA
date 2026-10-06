@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from arguments.fuma_config import split_sharpness, side_score_lr, split_dir_lr
 
 class GaussianModel:
 
@@ -51,6 +52,8 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity_core1 = torch.empty(0)
         self._opacity_core2 = torch.empty(0)
+        self._side_score = torch.empty(0)
+        self._split_direction = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -69,6 +72,8 @@ class GaussianModel:
             self._rotation,
             self._opacity_core1,
             self._opacity_core2,
+            self._side_score,
+            self._split_direction,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -85,6 +90,8 @@ class GaussianModel:
         self._rotation,
         self._opacity_core1,
         self._opacity_core2,
+        self._side_score,
+        self._split_direction,
         self.max_radii2D,
         xyz_gradient_accum, 
         denom,
@@ -113,19 +120,34 @@ class GaussianModel:
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
     
+    def compute_core_weight(self):
+        # FUMA dual-core soft partition (no-CUDA first version).
+        # Per-Gaussian learned side score -> smooth core mixing weight.
+        # The position-dependent w(x) = sigmoid(k * n^T (x - mu)) is deferred to
+        # the CUDA rasterizer step; split_direction is stored as its geometric anchor.
+        w1 = torch.sigmoid(split_sharpness * self._side_score)
+        w2 = 1.0 - w1
+        return w1, w2
+
+    def _normalize_split_direction(self, split_direction):
+        norms = split_direction.norm(dim=1, keepdim=True)
+        out = split_direction / norms.clamp_min(1e-8)
+        fallback = torch.zeros_like(split_direction)
+        fallback[:, 2] = 1.0
+        return torch.where(norms < 1e-8, fallback, out)
+
     @property
     def get_opacity(self):
         # FUMA dual-core: blend the two cores into one per-Gaussian opacity.
-        # Step 2 keeps equal weights so rendering is identical to original 3DGS;
-        # the soft partition weight (compute_core_weight) replaces this later.
-        return 0.5 * (self.opacity_activation(self._opacity_core1) +
-                      self.opacity_activation(self._opacity_core2))
+        w1, w2 = self.compute_core_weight()
+        return w1 * self.opacity_activation(self._opacity_core1) + \
+               w2 * self.opacity_activation(self._opacity_core2)
 
     def get_dual_opacity(self):
         opacity_core1 = self.opacity_activation(self._opacity_core1)
         opacity_core2 = self.opacity_activation(self._opacity_core2)
-        split_weight = 0.5 * torch.ones_like(opacity_core1)
-        return opacity_core1, opacity_core2, split_weight
+        w1, _ = self.compute_core_weight()
+        return opacity_core1, opacity_core2, w1
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -158,6 +180,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity_core1 = nn.Parameter(opacities.requires_grad_(True))
         self._opacity_core2 = nn.Parameter(opacities.requires_grad_(True))
+        side_score = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        split_direction = self._normalize_split_direction(torch.tensor(np.asarray(pcd.normals)).float().cuda())
+        self._side_score = nn.Parameter(side_score.requires_grad_(True))
+        self._split_direction = nn.Parameter(split_direction.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -171,6 +197,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity_core1], 'lr': training_args.opacity_lr, "name": "opacity_core1"},
             {'params': [self._opacity_core2], 'lr': training_args.opacity_lr, "name": "opacity_core2"},
+            {'params': [self._side_score], 'lr': side_score_lr, "name": "side_score"},
+            {'params': [self._split_direction], 'lr': split_dir_lr, "name": "split_direction"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
@@ -198,6 +226,7 @@ class GaussianModel:
             l.append('f_rest_{}'.format(i))
         l.append('opacity_core1')
         l.append('opacity_core2')
+        l.append('side_score')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -208,18 +237,19 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        normals = self._split_direction.detach().cpu().numpy()
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities_core1 = self._opacity_core1.detach().cpu().numpy()
         opacities_core2 = self._opacity_core2.detach().cpu().numpy()
+        side_score = self._side_score.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities_core1, opacities_core2, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities_core1, opacities_core2, side_score, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -241,6 +271,13 @@ class GaussianModel:
         ply_props = [p.name for p in plydata.elements[0].properties]
         opacities_core1 = np.asarray(plydata.elements[0]["opacity_core1"])[..., np.newaxis] if "opacity_core1" in ply_props else np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
         opacities_core2 = np.asarray(plydata.elements[0]["opacity_core2"])[..., np.newaxis] if "opacity_core2" in ply_props else np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        side_score = np.asarray(plydata.elements[0]["side_score"])[..., np.newaxis] if "side_score" in ply_props else np.zeros((xyz.shape[0], 1))
+        if "nx" in ply_props and "ny" in ply_props and "nz" in ply_props:
+            split_direction = np.stack((np.asarray(plydata.elements[0]["nx"]),
+                                        np.asarray(plydata.elements[0]["ny"]),
+                                        np.asarray(plydata.elements[0]["nz"])), axis=1)
+        else:
+            split_direction = np.zeros((xyz.shape[0], 3))
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -273,6 +310,8 @@ class GaussianModel:
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity_core1 = nn.Parameter(torch.tensor(opacities_core1, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity_core2 = nn.Parameter(torch.tensor(opacities_core2, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._side_score = nn.Parameter(torch.tensor(side_score, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._split_direction = nn.Parameter(self._normalize_split_direction(torch.tensor(split_direction, dtype=torch.float, device="cuda")).requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -320,6 +359,8 @@ class GaussianModel:
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity_core1 = optimizable_tensors["opacity_core1"]
         self._opacity_core2 = optimizable_tensors["opacity_core2"]
+        self._side_score = optimizable_tensors["side_score"]
+        self._split_direction = optimizable_tensors["split_direction"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -350,12 +391,14 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity_core1": new_opacities_core1,
         "opacity_core2": new_opacities_core2,
+        "side_score": new_side_score,
+        "split_direction": new_split_direction,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
 
@@ -365,6 +408,8 @@ class GaussianModel:
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity_core1 = optimizable_tensors["opacity_core1"]
         self._opacity_core2 = optimizable_tensors["opacity_core2"]
+        self._side_score = optimizable_tensors["side_score"]
+        self._split_direction = optimizable_tensors["split_direction"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -392,8 +437,10 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity_core1 = self._opacity_core1[selected_pts_mask].repeat(N,1)
         new_opacity_core2 = self._opacity_core2[selected_pts_mask].repeat(N,1)
+        new_side_score = self._side_score[selected_pts_mask].repeat(N,1)
+        new_split_direction = self._split_direction[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity_core1, new_opacity_core2, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity_core1, new_opacity_core2, new_side_score, new_split_direction, new_scaling, new_rotation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -409,10 +456,12 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities_core1 = self._opacity_core1[selected_pts_mask]
         new_opacities_core2 = self._opacity_core2[selected_pts_mask]
+        new_side_score = self._side_score[selected_pts_mask]
+        new_split_direction = self._split_direction[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities_core1, new_opacities_core2, new_side_score, new_split_direction, new_scaling, new_rotation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
