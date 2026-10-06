@@ -22,6 +22,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from arguments.fuma_config import (split_sharpness, side_score_lr, split_dir_lr,
+                                   core1_init_opacity, core2_init_opacity,
                                    fractal_lambda, fractal_gamma, fractal_downsample,
                                    fractal_patch_size, fractal_camera_stride,
                                    prune_w_opacity, prune_w_complexity, prune_w_gradient,
@@ -213,6 +214,18 @@ class GaussianModel:
         self._fractal_complexity = acc.detach()
         return self._fractal_complexity
 
+    def get_fractal_complexity(self):
+        """Per-Gaussian fractal complexity C_f in [0,1] (detached guidance)."""
+        return self._fractal_complexity
+
+    def get_medium_score(self, camera_centers, scene_extent):
+        """Per-Gaussian medium degradation score M in [0,1], computed on-the-fly
+        from the current depth + colour attenuation (detached modulator)."""
+        from utils.medium_utils import estimate_medium_quality
+        sh_dc = self._features_dc.detach()[:, 0, :]  # [N,3] DC coeff per channel
+        return estimate_medium_quality(self.get_xyz.detach(), sh_dc,
+                                       camera_centers, scene_extent)
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -235,15 +248,19 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # FUMA: asymmetric dual-core opacity init breaks the symmetry deadlock —
+        # core1 (object/direct) starts higher, core2 (medium/scatter) lower.
+        # Sum keeps the blended opacity close to the original 0.1 initialisation.
+        opacities_core1 = inverse_sigmoid(core1_init_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities_core2 = inverse_sigmoid(core2_init_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
-        self._opacity_core1 = nn.Parameter(opacities.requires_grad_(True))
-        self._opacity_core2 = nn.Parameter(opacities.requires_grad_(True))
+        self._opacity_core1 = nn.Parameter(opacities_core1.requires_grad_(True))
+        self._opacity_core2 = nn.Parameter(opacities_core2.requires_grad_(True))
         side_score = torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
         split_direction = self._normalize_split_direction(torch.tensor(np.asarray(pcd.normals)).float().cuda())
         self._side_score = nn.Parameter(side_score.requires_grad_(True))
