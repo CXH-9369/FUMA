@@ -1,5 +1,5 @@
 # FUMA hyperparameters.
-# Module-level constants for now; wire into argparse if CLI tunability is needed.
+# Module-level constants; wire into argparse if CLI tunability is needed.
 
 # Dual-core soft partition: w1 = sigmoid(split_sharpness * side_score)
 split_sharpness = 10.0
@@ -12,6 +12,9 @@ split_dir_lr = 0.0005
 # core2 = "medium/scatter" core (lower). Chosen so the blended opacity stays 0.1.
 core1_init_opacity = 0.15
 core2_init_opacity = 0.05
+
+# Single-opacity init used when the dual-core is disabled (original 3DGS value).
+baseline_init_opacity = 0.1
 
 # Fractal-guided densification (Step 6).
 # Adaptive gradient threshold: T_i = T_0 * (1 - fractal_lambda * C_f_i)
@@ -39,3 +42,51 @@ structure_lambda = 0.05
 # Medium degradation score M = w_depth * depth_norm + w_color * color_attenuation.
 medium_w_depth = 0.6
 medium_w_color = 0.4
+
+
+# ---------------------------------------------------------------------------
+# Step 8 — Ablation switches.
+#
+# Each FUMA mechanism can be toggled independently; False restores the original
+# 3DGS behaviour. The five ablation configs follow the spec's Section 10:
+#   A: 3DGS baseline
+#   B: + Dual-Core            (dual opacity + structure loss to activate it)
+#   C: + Fractal Growth       (fractal-guided densification + fractal-aware pruning)
+#   D: + Medium Regularization(dual-core substrate + medium reg, no structure loss)
+#   E: Full FUMA
+# ---------------------------------------------------------------------------
+use_dual_core = True        # dual-core opacity representation (core1/core2 + side_score)
+use_fractal_growth = True   # fractal-guided densification + fractal-aware pruning
+use_medium_reg = True       # medium-adaptive opacity regularization loss
+use_structure_loss = True   # structure loss (activates the dual-core separation)
+
+
+_ABLATIONS = {
+    'A': dict(use_dual_core=False, use_fractal_growth=False, use_medium_reg=False, use_structure_loss=False),
+    'B': dict(use_dual_core=True,  use_fractal_growth=False, use_medium_reg=False, use_structure_loss=True),
+    'C': dict(use_dual_core=False, use_fractal_growth=True,  use_medium_reg=False, use_structure_loss=False),
+    'D': dict(use_dual_core=True,  use_fractal_growth=False, use_medium_reg=True,  use_structure_loss=False),
+    'E': dict(use_dual_core=True,  use_fractal_growth=True,  use_medium_reg=True,  use_structure_loss=True),
+}
+
+
+def apply_ablation(name):
+    """Set the module-level switches for an ablation config.
+
+    Args:
+        name: one of 'A'..'E', or None/'' to keep the current (default) switches.
+
+    Returns:
+        dict of the active switch values (for logging).
+    """
+    global use_dual_core, use_fractal_growth, use_medium_reg, use_structure_loss
+    if name in _ABLATIONS:
+        cfg = _ABLATIONS[name]
+        use_dual_core = cfg['use_dual_core']
+        use_fractal_growth = cfg['use_fractal_growth']
+        use_medium_reg = cfg['use_medium_reg']
+        use_structure_loss = cfg['use_structure_loss']
+    return dict(use_dual_core=use_dual_core,
+                use_fractal_growth=use_fractal_growth,
+                use_medium_reg=use_medium_reg,
+                use_structure_loss=use_structure_loss)

@@ -22,7 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from arguments.fuma_config import medium_lambda, structure_lambda
+import arguments.fuma_config as FC
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,13 +40,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.restore(model_params, opt)
 
     # FUMA: assign fractal complexity C_f to the initial Gaussians by projecting them
-    # into the training views and sampling precomputed DBC fractal maps.
-    gaussians.compute_fractal_complexity(scene.getTrainCameras())
+    # into the training views and sampling precomputed DBC fractal maps. Only needed
+    # when fractal growth or the structure loss is active.
+    if FC.use_fractal_growth or FC.use_structure_loss:
+        gaussians.compute_fractal_complexity(scene.getTrainCameras())
 
     # FUMA: camera centres + extent for the on-the-fly medium degradation score.
-    train_cameras = scene.getTrainCameras()
-    camera_centers = torch.stack([cam.camera_center for cam in train_cameras]).detach()
-    scene_extent = scene.cameras_extent
+    if FC.use_medium_reg:
+        train_cameras = scene.getTrainCameras()
+        camera_centers = torch.stack([cam.camera_center for cam in train_cameras]).detach()
+        scene_extent = scene.cameras_extent
+    else:
+        camera_centers = None
+        scene_extent = None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -104,13 +110,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # FUMA: medium-adaptive opacity regularization couples the two cores in
         # degraded regions, while the structure loss amplifies their separation in
         # complex/clear regions — together they activate the dual-core.
-        opacity_core1, opacity_core2, _ = gaussians.get_dual_opacity()      # [N,1] each
-        opacity_diff_sq = (opacity_core1 - opacity_core2).pow(2)
-        c_f = gaussians.get_fractal_complexity()                             # [N,1]
-        medium_score = gaussians.get_medium_score(camera_centers, scene_extent)  # [N,1]
-        loss_medium = (medium_score * opacity_diff_sq).mean()
-        loss_structure = -(c_f * opacity_diff_sq).mean()
-        loss = rgb_loss + medium_lambda * loss_medium + structure_lambda * loss_structure
+        loss = rgb_loss
+        if FC.use_dual_core and (FC.use_medium_reg or FC.use_structure_loss):
+            opacity_core1, opacity_core2, _ = gaussians.get_dual_opacity()   # [N,1] each
+            opacity_diff_sq = (opacity_core1 - opacity_core2).pow(2)
+            if FC.use_medium_reg:
+                medium_score = gaussians.get_medium_score(camera_centers, scene_extent)  # [N,1]
+                loss = loss + FC.medium_lambda * (medium_score * opacity_diff_sq).mean()
+            if FC.use_structure_loss:
+                c_f = gaussians.get_fractal_complexity()                     # [N,1]
+                loss = loss - FC.structure_lambda * (c_f * opacity_diff_sq).mean()
         loss.backward()
 
         iter_end.record()
@@ -222,6 +231,9 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument('--fuma_ablation', type=str, default=None, choices=['A', 'B', 'C', 'D', 'E'],
+                        help='FUMA ablation config: A=baseline, B=+dual-core, '
+                             'C=+fractal-growth, D=+medium-reg, E=full FUMA')
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -233,6 +245,11 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+
+    # FUMA ablation: apply the requested config's switches before training.
+    cfg = FC.apply_ablation(args.fuma_ablation)
+    if args.fuma_ablation:
+        print("FUMA ablation config {}: {}".format(args.fuma_ablation, cfg))
 
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)

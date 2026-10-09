@@ -21,12 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from arguments.fuma_config import (split_sharpness, side_score_lr, split_dir_lr,
-                                   core1_init_opacity, core2_init_opacity,
-                                   fractal_lambda, fractal_gamma, fractal_downsample,
-                                   fractal_patch_size, fractal_camera_stride,
-                                   prune_w_opacity, prune_w_complexity, prune_w_gradient,
-                                   prune_retention_thresh)
+import arguments.fuma_config as FC
 
 class GaussianModel:
 
@@ -135,7 +130,7 @@ class GaussianModel:
         # Per-Gaussian learned side score -> smooth core mixing weight.
         # The position-dependent w(x) = sigmoid(k * n^T (x - mu)) is deferred to
         # the CUDA rasterizer step; split_direction is stored as its geometric anchor.
-        w1 = torch.sigmoid(split_sharpness * self._side_score)
+        w1 = torch.sigmoid(FC.split_sharpness * self._side_score)
         w2 = 1.0 - w1
         return w1, w2
 
@@ -149,6 +144,10 @@ class GaussianModel:
     @property
     def get_opacity(self):
         # FUMA dual-core: blend the two cores into one per-Gaussian opacity.
+        # Ablation A/C/D (no dual-core) fall back to a single core so the renderer
+        # and pruning behave exactly like the original 3DGS.
+        if not FC.use_dual_core:
+            return self.opacity_activation(self._opacity_core1)
         w1, w2 = self.compute_core_weight()
         return w1 * self.opacity_activation(self._opacity_core1) + \
                w2 * self.opacity_activation(self._opacity_core2)
@@ -159,9 +158,9 @@ class GaussianModel:
         w1, _ = self.compute_core_weight()
         return opacity_core1, opacity_core2, w1
 
-    def compute_fractal_complexity(self, cameras, patch_size=fractal_patch_size,
-                                   scales=(2, 4, 8, 16), downsample=fractal_downsample,
-                                   camera_stride=fractal_camera_stride):
+    def compute_fractal_complexity(self, cameras, patch_size=FC.fractal_patch_size,
+                                   scales=(2, 4, 8, 16), downsample=FC.fractal_downsample,
+                                   camera_stride=FC.fractal_camera_stride):
         """
         FUMA: assign each Gaussian a fractal complexity C_f in [0, 1].
 
@@ -251,8 +250,15 @@ class GaussianModel:
         # FUMA: asymmetric dual-core opacity init breaks the symmetry deadlock —
         # core1 (object/direct) starts higher, core2 (medium/scatter) lower.
         # Sum keeps the blended opacity close to the original 0.1 initialisation.
-        opacities_core1 = inverse_sigmoid(core1_init_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-        opacities_core2 = inverse_sigmoid(core2_init_opacity * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # Ablation configs without the dual-core use the standard single-opacity init.
+        if FC.use_dual_core:
+            o1 = FC.core1_init_opacity
+            o2 = FC.core2_init_opacity
+        else:
+            o1 = FC.baseline_init_opacity
+            o2 = FC.baseline_init_opacity
+        opacities_core1 = inverse_sigmoid(o1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities_core2 = inverse_sigmoid(o2 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -280,8 +286,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity_core1], 'lr': training_args.opacity_lr, "name": "opacity_core1"},
             {'params': [self._opacity_core2], 'lr': training_args.opacity_lr, "name": "opacity_core2"},
-            {'params': [self._side_score], 'lr': side_score_lr, "name": "side_score"},
-            {'params': [self._split_direction], 'lr': split_dir_lr, "name": "split_direction"},
+            {'params': [self._side_score], 'lr': FC.side_score_lr, "name": "side_score"},
+            {'params': [self._split_direction], 'lr': FC.split_dir_lr, "name": "split_direction"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
@@ -515,8 +521,10 @@ class GaussianModel:
         padded_grad[:grads.shape[0]] = grads.squeeze()
         # FUMA: fractal-adaptive threshold T_i = T_0 * (1 - lambda * C_f_i) — complex
         # regions split at a lower gradient so they receive more Gaussians.
+        # lambda = 0 when fractal growth is disabled -> standard 3DGS threshold.
         c_f = self._fractal_complexity.squeeze(-1)
-        split_threshold = grad_threshold * (1.0 - fractal_lambda * c_f)
+        lam = FC.fractal_lambda if FC.use_fractal_growth else 0.0
+        split_threshold = grad_threshold * (1.0 - lam * c_f)
         selected_pts_mask = torch.where(padded_grad >= split_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
@@ -527,9 +535,10 @@ class GaussianModel:
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         # FUMA: fractal-adaptive child scale s' = s * (1 - gamma * C_f_i) — finer
-        # Gaussians in complex regions.
+        # Gaussians in complex regions. gamma = 0 -> standard 3DGS child scale.
         c_f_rep = c_f[selected_pts_mask].unsqueeze(-1).repeat(N, 1)
-        child_scaling = self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N) * (1.0 - fractal_gamma * c_f_rep)
+        gam = FC.fractal_gamma if FC.use_fractal_growth else 0.0
+        child_scaling = self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N) * (1.0 - gam * c_f_rep)
         new_scaling = self.scaling_inverse_activation(child_scaling)
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
@@ -550,7 +559,8 @@ class GaussianModel:
         # Extract points that satisfy the gradient condition
         # FUMA: fractal-adaptive threshold T_i = T_0 * (1 - lambda * C_f_i).
         c_f = self._fractal_complexity.squeeze(-1)
-        clone_threshold = grad_threshold * (1.0 - fractal_lambda * c_f)
+        lam = FC.fractal_lambda if FC.use_fractal_growth else 0.0
+        clone_threshold = grad_threshold * (1.0 - lam * c_f)
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= clone_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
@@ -583,11 +593,15 @@ class GaussianModel:
 
         # FUMA: fractal-aware retention score R = w1*a + w2*C_f + w3*M. Low-opacity
         # Gaussians in complex structure or with high gradient are retained.
-        alpha = self.get_opacity.squeeze(-1)
-        c_f = self._fractal_complexity.squeeze(-1)
-        m = self._grad_mag.squeeze(-1)
-        retention = prune_w_opacity * alpha + prune_w_complexity * c_f + prune_w_gradient * m
-        prune_mask = retention < prune_retention_thresh
+        # Disabled -> standard 3DGS opacity threshold.
+        if FC.use_fractal_growth:
+            alpha = self.get_opacity.squeeze(-1)
+            c_f = self._fractal_complexity.squeeze(-1)
+            m = self._grad_mag.squeeze(-1)
+            retention = FC.prune_w_opacity * alpha + FC.prune_w_complexity * c_f + FC.prune_w_gradient * m
+            prune_mask = retention < FC.prune_retention_thresh
+        else:
+            prune_mask = (self.get_opacity < min_opacity).squeeze()
 
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
