@@ -120,6 +120,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if FC.use_structure_loss:
                 c_f = gaussians.get_fractal_complexity()                     # [N,1]
                 loss = loss - FC.structure_lambda * (c_f * opacity_diff_sq).mean()
+        # FUMA: manifold x fractal surface prior on core1, applied only after the
+        # densification phase so the Gaussian set is stable (the kNN neighbours are
+        # then refreshed every manifold_knn_every iterations, not re-built per step).
+        if FC.use_manifold and iteration > opt.densify_until_iter:
+            loss = loss + gaussians.compute_manifold_loss(iteration)
         loss.backward()
 
         iter_end.record()
@@ -231,9 +236,10 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument('--fuma_ablation', type=str, default=None, choices=['A', 'B', 'C', 'D', 'E'],
+    parser.add_argument('--fuma_ablation', type=str, default=None, choices=['A', 'B', 'C', 'D', 'E', 'F', 'G'],
                         help='FUMA ablation config: A=baseline, B=+dual-core, '
-                             'C=+fractal-growth, D=+medium-reg, E=full FUMA')
+                             'C=+fractal-growth, D=+medium-reg, E=full FUMA, '
+                             'F=B+D+manifold, G=B+D (no manifold)')
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

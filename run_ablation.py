@@ -20,13 +20,15 @@ import time
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PY = "/home/cxh/anaconda3/envs/FUMA/bin/python"
 
-CONFIGS = ['A', 'B', 'C', 'D', 'E']
+CONFIGS = ['A', 'B', 'C', 'D', 'E', 'G', 'F']
 CONFIG_DESC = {
     'A': '3DGS baseline',
     'B': '+ Dual-Core',
     'C': '+ Fractal Growth',
     'D': '+ Medium Regularization',
     'E': 'Full FUMA',
+    'G': 'B+D (no manifold)',
+    'F': 'B+D + Manifold',
 }
 
 

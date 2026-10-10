@@ -57,6 +57,8 @@ class GaussianModel:
         self._split_direction = torch.empty(0)
         self._fractal_complexity = torch.empty(0)
         self._grad_mag = torch.empty(0)
+        self._knn_indices = None   # cached kNN neighbours (manifold normal consistency)
+        self._knn_iter = -1
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -227,6 +229,64 @@ class GaussianModel:
 
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+
+    def get_surface_normal(self):
+        """Per-Gaussian surface normal = the smallest-scale axis of the covariance
+        (the direction the Gaussian is flattest along). This is the 2DGS/SuGaR
+        manifold normal, derived from rotation + scale, with no extra parameters.
+        The axis selection is non-differentiable; gradient flows only through the
+        selected rotation column."""
+        R = build_rotation(self._rotation)          # [N,3,3]
+        scales = self.get_scaling                   # [N,3]
+        min_axis = scales.argmin(dim=1)             # [N]
+        idx = torch.arange(R.shape[0], device=R.device)
+        normal = R[idx, :, min_axis]                # [N,3]
+        return F.normalize(normal, dim=-1)
+
+    def _compute_knn_neighbors(self, k=None):
+        """k nearest neighbours by position via scipy cKDTree (CPU), excluding self."""
+        from scipy.spatial import cKDTree
+        k = k or FC.manifold_knn_k
+        xyz = self.get_xyz.detach().cpu().numpy()
+        _, idx = cKDTree(xyz).query(xyz, k=k + 1)
+        return torch.from_numpy(idx[:, 1:].astype(np.int64)).to(self.get_xyz.device)
+
+    def _get_knn_neighbors(self, iteration):
+        """Return cached kNN indices, recomputing when stale or size-mismatched."""
+        if (self._knn_indices is None
+                or self._knn_indices.shape[0] != self.get_xyz.shape[0]
+                or iteration - self._knn_iter >= FC.manifold_knn_every):
+            self._knn_indices = self._compute_knn_neighbors()
+            self._knn_iter = iteration
+        return self._knn_indices
+
+    def compute_manifold_loss(self, iteration):
+        """Manifold x fractal surface prior on core1 (the surface core).
+
+        Both terms are weighted by w = alpha_core1 * (1 - C_f) (detached), so only
+        the shared geometry (scaling/rotation) gets gradient, never the opacity or
+        the dual-core weights:
+          flatness            minimise the smallest scale axis  -> flat patches
+          normal consistency  align each Gaussian's normal with its kNN neighbours
+        C_f modulates strength: smooth regions (low C_f) are flattened/smoothed
+        hard, complex regions (high C_f) keep detail. Core2 (scatter) shares the
+        geometry but its alpha is excluded from w, so it stays volumetric.
+        """
+        alpha1 = self.opacity_activation(self._opacity_core1).squeeze(-1)  # [N]
+        c_f = self._fractal_complexity.squeeze(-1)                          # [N]
+        w = (alpha1 * (1.0 - c_f).clamp_min(0.0)).detach()                  # [N]
+        wmean = w.mean() + 1e-8
+
+        s_min = self.get_scaling.min(dim=1).values                          # [N]
+        flat_term = (w * s_min).mean() / wmean
+
+        normal = self.get_surface_normal()                                  # [N,3]
+        knn = self._get_knn_neighbors(iteration)                            # [N,K]
+        cos = torch.abs((normal.unsqueeze(1) * normal[knn]).sum(-1))        # [N,K]
+        w_pair = torch.sqrt(w.unsqueeze(1) * w[knn] + 1e-8)
+        norm_term = (w_pair * (1.0 - cos)).mean() / (w_pair.mean() + 1e-8)
+
+        return FC.manifold_flat_lambda * flat_term + FC.manifold_norm_lambda * norm_term
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
