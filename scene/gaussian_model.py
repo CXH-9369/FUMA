@@ -588,23 +588,25 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        # FUMA: cache the normalised gradient magnitude for the retention score
-        # before clone/split zero the accumulators (children inherit parent value).
+        # FUMA: cache the normalised gradient magnitude before clone/split zero the
+        # accumulators (children inherit the parent value). Not used by the current
+        # pruning (complexity-modulated threshold); kept as a per-Gaussian signal
+        # for future retention / manifold consistency terms.
         grad_mag = grads.squeeze(-1)
         self._grad_mag = (grad_mag / (grad_mag.max() + 1e-8)).unsqueeze(-1)
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        # FUMA: fractal-aware retention score R = w1*a + w2*C_f + w3*M. Low-opacity
-        # Gaussians in complex structure or with high gradient are retained.
+        # FUMA: fractal-aware pruning — complexity-modulated opacity threshold.
+        # Prune when alpha < min_opacity * (1 - beta * C_f): complex regions retain
+        # more (lower threshold), smooth regions prune normally. Keeps the Gaussian
+        # count near baseline while biasing retention toward structure.
         # Disabled -> standard 3DGS opacity threshold.
         if FC.use_fractal_growth:
             alpha = self.get_opacity.squeeze(-1)
             c_f = self._fractal_complexity.squeeze(-1)
-            m = self._grad_mag.squeeze(-1)
-            retention = FC.prune_w_opacity * alpha + FC.prune_w_complexity * c_f + FC.prune_w_gradient * m
-            prune_mask = retention < FC.prune_retention_thresh
+            prune_mask = (alpha < min_opacity * (1.0 - FC.fractal_prune_beta * c_f)).squeeze()
         else:
             prune_mask = (self.get_opacity < min_opacity).squeeze()
 

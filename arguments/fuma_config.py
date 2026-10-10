@@ -18,19 +18,20 @@ baseline_init_opacity = 0.1
 
 # Fractal-guided densification (Step 6).
 # Adaptive gradient threshold: T_i = T_0 * (1 - fractal_lambda * C_f_i)
-fractal_lambda = 0.5
+fractal_lambda = 0.2
 # Adaptive child scale on split: s' = s * (1 - fractal_gamma * C_f_i)
-fractal_gamma = 0.5
+fractal_gamma = 0.15
 # Image pre-processing for the DBC fractal maps.
 fractal_downsample = 2     # downsample factor before computing fractal maps
 fractal_patch_size = 16    # local window for DBC
 fractal_camera_stride = 1  # use every Nth training camera (1 = all)
 
-# Fractal-aware pruning retention score R = w1*a + w2*C_f + w3*M
-prune_w_opacity = 0.5
-prune_w_complexity = 0.3
-prune_w_gradient = 0.2
-prune_retention_thresh = 0.005
+# Fractal-aware pruning (Step 8 tuning): complexity-modulated opacity threshold.
+# Prune when alpha < min_opacity * (1 - fractal_prune_beta * C_f). Complex regions
+# (high C_f) get a lower threshold -> retained more; smooth regions prune normally.
+# Replaces the earlier retention score R = w1*a + w2*C_f + w3*M, whose C_f/M terms
+# dominated the 0.005 threshold and disabled pruning (2x Gaussian bloat, no gain).
+fractal_prune_beta = 0.5
 
 # Medium-adaptive opacity regularization (Step 7).
 # L_medium = medium_lambda * mean(M * (a1-a2)^2)  — couple the two cores in
