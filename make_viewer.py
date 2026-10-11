@@ -1,11 +1,17 @@
 #!/usr/bin/env python
 # FUMA mesh viewer generator — turn a reconstructed mesh (.ply/.obj/.glb) into a
-# single self-contained interactive HTML file (Three.js + OrbitControls).
+# single fully self-contained interactive HTML file (Three.js + OrbitControls).
 #
-# The mesh is exported to GLB, base64-embedded into the HTML, so the result opens
-# by double-clicking (file://) or via VSCode's browser preview / Live Server —
-# no server, no CORS, no extra files. Three.js is fetched from a CDN (needs
-# internet on the viewing machine, or swap the import map for a local copy).
+# The mesh is exported to GLB, base64-embedded into the HTML, AND Three.js r128
+# (classic UMD build, no ES modules / no import-map / no CDN) is inlined too, so
+# the result opens:
+#   - by double-clicking (file://)
+#   - via any static server (e.g. python -m http.server)
+#   - in VSCode's Simple Browser / Live Server
+# No network, no CORS, no external files required. Works in any browser.
+#
+# The inlined library files live next to this script in viewer_lib/:
+#   three.min.js, OrbitControls.js, GLTFLoader.js  (three@0.128.0, examples/js)
 #
 # Usage:
 #   python make_viewer.py <mesh.ply> -o viewer.html [--simplify 200000]
@@ -14,6 +20,7 @@
 
 import argparse
 import base64
+import os
 
 import numpy as np
 import open3d as o3d
@@ -27,91 +34,104 @@ TEMPLATE = """<!DOCTYPE html>
 <style>
   html, body { margin:0; padding:0; overflow:hidden; background:#11151a; height:100%; font-family:system-ui,sans-serif; }
   #info { position:absolute; top:12px; left:12px; color:#e6edf3; background:rgba(0,0,0,.55); padding:9px 13px; border-radius:7px; font-size:13px; line-height:1.6; pointer-events:none; white-space:pre-line; }
+  #status { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:#ffd166; background:rgba(0,0,0,.72); padding:14px 20px; border-radius:8px; font-size:15px; line-height:1.7; text-align:center; max-width:82%; }
   #toolbar { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); display:flex; gap:8px; }
   button { background:rgba(255,255,255,.12); color:#e6edf3; border:1px solid rgba(255,255,255,.28); padding:7px 14px; border-radius:6px; cursor:pointer; font-size:13px; }
   button:hover { background:rgba(255,255,255,.24); }
   button.on { background:#2f81f7; border-color:#2f81f7; }
 </style>
-<script type="importmap">
-{ "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
-</script>
+<script>%%THREE_JS%%</script>
+<script>%%ORBIT_JS%%</script>
+<script>%%GLTF_JS%%</script>
 </head>
 <body>
 <div id="info"></div>
+<div id="status">正在加载三维模型…</div>
 <div id="toolbar">
   <button id="bSolid">实体</button>
   <button id="bNormal" class="on">法向</button>
   <button id="bWire">线框</button>
 </div>
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+<script>
+(function(){
+  var statusEl = document.getElementById('status');
+  function fail(msg){ if (statusEl) statusEl.innerHTML = '⚠️ ' + msg; }
+  try {
+    var GLB_B64 = %%B64%%;
+    var bin = atob(GLB_B64);
+    var buf = (function(){ var b = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b.buffer; })();
 
-const GLB_B64 = %%B64%%;
+    var renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    document.body.appendChild(renderer.domElement);
 
-const buf = (() => { const bin = atob(GLB_B64); const b = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b.buffer; })();
+    var scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x11151a);
+    var camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.0001, 1000);
 
-const renderer = new THREE.WebGLRenderer({ antialias:true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-document.body.appendChild(renderer.domElement);
+    var controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x11151a);
-const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.0001, 1000);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    var key = new THREE.DirectionalLight(0xffffff, 1.8); key.position.set(2,3,4); scene.add(key);
+    var fill = new THREE.DirectionalLight(0x88bbff, 0.5); fill.position.set(-3,-1,-2); scene.add(fill);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
+    var mesh = null;
+    var nVerts = %%NVERTS%%, nTris = %%NTRIS%%;
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-const key = new THREE.DirectionalLight(0xffffff, 1.8); key.position.set(2,3,4); scene.add(key);
-const fill = new THREE.DirectionalLight(0x88bbff, 0.5); fill.position.set(-3,-1,-2); scene.add(fill);
+    new THREE.GLTFLoader().parse(buf, '', function(gltf){
+      mesh = gltf.scene;
+      mesh.traverse(function(o){ if (o.isMesh) o.geometry.computeVertexNormals(); });
+      var box = new THREE.Box3().setFromObject(mesh);
+      var c = box.getCenter(new THREE.Vector3());
+      var s = box.getSize(new THREE.Vector3());
+      mesh.position.sub(c);
+      var d = Math.max(s.x, s.y, s.z) || 1;
+      camera.position.set(d*0.6, d*0.45, d*1.2);
+      camera.near = d/2000; camera.far = d*200; camera.updateProjectionMatrix();
+      controls.target.set(0,0,0); controls.update();
+      setMat('normal');
+      if (statusEl) statusEl.style.display = 'none';
+      document.getElementById('info').textContent =
+        'FUMA mesh — ' + nVerts.toLocaleString() + ' verts / ' + nTris.toLocaleString() + ' tris\\n' +
+        '拖拽=旋转  右键=平移  滚轮=缩放';
+    }, function(err){ fail('模型解析失败：' + err); });
 
-let mesh = null;
-const nVerts = %%NVERTS%%, nTris = %%NTRIS%%;
+    function setMat(mode) {
+      if (!mesh) return;
+      mesh.traverse(function(o){ if (o.isMesh) {
+        if (o.material) o.material.dispose();
+        o.material = mode === 'normal' ? new THREE.MeshNormalMaterial()
+                   : mode === 'wire'   ? new THREE.MeshStandardMaterial({ color:0x2a2a2a, wireframe:true })
+                   : new THREE.MeshStandardMaterial({ color:0x9ab3c4, roughness:0.62, metalness:0.06 });
+      }});
+      ['bSolid','bNormal','bWire'].forEach(function(id){ document.getElementById(id).classList.remove('on'); });
+      document.getElementById(mode==='normal'?'bNormal':mode==='wire'?'bWire':'bSolid').classList.add('on');
+    }
+    document.getElementById('bSolid').onclick = function(){ setMat('solid'); };
+    document.getElementById('bNormal').onclick = function(){ setMat('normal'); };
+    document.getElementById('bWire').onclick = function(){ setMat('wire'); };
 
-new GLTFLoader().parse(buf, '', (gltf) => {
-  mesh = gltf.scene;
-  mesh.traverse(o => { if (o.isMesh) o.geometry.computeVertexNormals(); });
-  const box = new THREE.Box3().setFromObject(mesh);
-  const c = box.getCenter(new THREE.Vector3());
-  const s = box.getSize(new THREE.Vector3());
-  mesh.position.sub(c);
-  const d = Math.max(s.x, s.y, s.z) || 1;
-  camera.position.set(d*0.6, d*0.45, d*1.2);
-  camera.near = d/2000; camera.far = d*200; camera.updateProjectionMatrix();
-  controls.target.set(0,0,0); controls.update();
-  setMat('normal');
-  document.getElementById('info').textContent =
-    'FUMA mesh — ' + nVerts.toLocaleString() + ' verts / ' + nTris.toLocaleString() + ' tris\\n' +
-    '拖拽=旋转  右键=平移  滚轮=缩放';
-});
-
-function setMat(mode) {
-  if (!mesh) return;
-  mesh.traverse(o => { if (o.isMesh) {
-    if (o.material) o.material.dispose();
-    o.material = mode === 'normal' ? new THREE.MeshNormalMaterial()
-               : mode === 'wire'   ? new THREE.MeshStandardMaterial({ color:0x2a2a2a, wireframe:true })
-               : new THREE.MeshStandardMaterial({ color:0x9ab3c4, roughness:0.62, metalness:0.06 });
-  }});
-  ['bSolid','bNormal','bWire'].forEach(id => document.getElementById(id).classList.remove('on'));
-  document.getElementById(mode==='normal'?'bNormal':mode==='wire'?'bWire':'bSolid').classList.add('on');
-}
-document.getElementById('bSolid').onclick = () => setMat('solid');
-document.getElementById('bNormal').onclick = () => setMat('normal');
-document.getElementById('bWire').onclick = () => setMat('wire');
-
-addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
-(function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+    addEventListener('resize', function(){ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+    (function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+  } catch(e) {
+    fail('渲染初始化失败：' + e.message);
+  }
+})();
 </script>
 </body>
 </html>
 """
+
+_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer_lib")
+
+
+def _read_lib(name):
+    p = os.path.join(_LIB_DIR, name)
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def main():
@@ -134,7 +154,7 @@ def main():
     nv, nt = len(mesh.vertices), len(mesh.triangles)
 
     # export via trimesh so the GLB uses float32 (open3d writes float64 -> 2x size)
-    import os, tempfile
+    import tempfile
     import trimesh
     tm = trimesh.Trimesh(vertices=np.asarray(mesh.vertices, dtype=np.float32),
                          faces=np.asarray(mesh.triangles, dtype=np.int32),
@@ -152,6 +172,9 @@ def main():
     b64_js = "[\n" + ",\n".join('"%s"' % ln for ln in lines) + "\n].join('')"
 
     html = (TEMPLATE
+            .replace("%%THREE_JS%%", _read_lib("three.min.js"))
+            .replace("%%ORBIT_JS%%", _read_lib("OrbitControls.js"))
+            .replace("%%GLTF_JS%%", _read_lib("GLTFLoader.js"))
             .replace("%%B64%%", b64_js)
             .replace("%%NVERTS%%", str(nv))
             .replace("%%NTRIS%%", str(nt)))
